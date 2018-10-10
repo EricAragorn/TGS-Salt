@@ -1,6 +1,5 @@
 import gc
 
-import numpy as np
 import cv2 as cv
 import pandas as pd
 import tensorflow as tf
@@ -251,10 +250,10 @@ def main():
         sess.run(tf.global_variables_initializer())
         for step in range(2000):
             if step % 10 == 0:
-                loss = sess.run(m.loss, feed_dict={m.input: val_set['image'], m.target: val_set['mask'], m.lr: [0.001]})
+                loss = sess.run(m.loss, feed_dict={m.input: val_set['image'], m.target: val_set['mask'], m.lr: 0.001})
                 print("Step %d, Loss: %f" % (step, loss))
             batch = TGS_dataset.next_training_batch()
-            sess.run(m.train_op, feed_dict={m.input: batch['image'], m.target: batch['mask'], m.lr: [0.001]})
+            sess.run(m.train_op, feed_dict={m.input: batch['image'], m.target: batch['mask'], m.lr: 0.001})
 
 
 def test_dataset():
@@ -264,4 +263,4 @@ def test_dataset():
 
 
 if __name__ == "__main__":
-    test_dataset()
+    main()
