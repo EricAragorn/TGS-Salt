@@ -1,11 +1,10 @@
+import gc
+
 import numpy as np
-import pandas as pd
 import cv2 as cv
+import pandas as pd
 import tensorflow as tf
 from sklearn.utils import shuffle
-from skimage.transform import resize
-
-import gc
 
 
 class Config:
@@ -39,33 +38,49 @@ class Batcher:
 class Dataset:
     def __init__(self):
         # TODO Target_data must be converted to mask
-        # TODO Problems with reading images after sorting >:(
-        # read id-depth pairs and corresponding images
-        rawdata = pd.read_csv("depths.csv")
 
-        rawdata["image"] = [cv.imread("train\\images\\%s.png" % id_TGS, cv.IMREAD_GRAYSCALE) for id_TGS in
-                            rawdata["id"]]
-        rawdata["mask"] = [cv.imread("train\\masks\\%s.png" % id_TGS, cv.IMREAD_GRAYSCALE) for id_TGS in rawdata["id"]]
+        # use `itertuples` instead of `iterrows` for performance reason; row[1] = id, row[2] = z
+        data = [self.to_dict(row[1], row[2]) for row in pd.read_csv("depths.csv").itertuples()]
 
-        shuffle(rawdata)
+        # remove data entries with no image/mask
+        data = [img for img in data if img["mask"] is not None]
 
-        self.training = rawdata.iloc[:int(Config.TRAINING_SET_RATIO * rawdata.shape[0]), :]
-        self.validation = rawdata.iloc[int(Config.TRAINING_SET_RATIO * rawdata.shape[0]) + 1:, :]
+        self.num = len(data)
+
+        shuffle(data)
+
+        self.training = data[:int(Config.TRAINING_SET_RATIO * self.num)]
+        self.validation = data[int(Config.TRAINING_SET_RATIO * self.num) + 1:]
         self.batch_base_ptr = 0
 
-
     def next_training_batch(self, size=256):
-        if self.batch_base_ptr + 256 > self.training.shape[0]:
-            batch = self.training.iloc[self.batch_base_ptr:self.training.shape[0], :]
+        if self.batch_base_ptr + size > self.num:
+            batch = self.training[self.batch_base_ptr:self.num]
             self.batch_base_ptr = 0
         else:
-            batch = self.training.iloc[self.batch_base_ptr: self.batch_base_ptr + size, :]
+            batch = self.training[self.batch_base_ptr: self.batch_base_ptr + size]
             self.batch_base_ptr = self.batch_base_ptr + size
-        return [batch["image"], batch["z"], batch["mask"]]
+        return self.output(batch)
 
     def get_validation(self):
-        return [self.validation["image"], self.validation["z"], self.validation["mask"]]
+        return self.output(self.validation)
 
+    @staticmethod
+    def to_dict(id, z):
+        return {
+            "image": cv.imread(f"train/masks/{id}.png", cv.IMREAD_GRAYSCALE),
+            "mask": cv.imread(f"train/images/{id}.png", cv.IMREAD_GRAYSCALE),
+            "z": z,
+            "id": id
+        }
+
+    @staticmethod
+    def output(data):
+        return {
+            "image": [e['image'].reshape((101, 101, 1)) for e in data],
+            "z": [e['z'] for e in data],
+            "mask": [e['mask'].reshape((101, 101, 1)) for e in data]
+        }
 
 
 class TGSModel:
@@ -236,16 +251,16 @@ def main():
         sess.run(tf.global_variables_initializer())
         for step in range(2000):
             if step % 10 == 0:
-                loss = sess.run(m.loss, feed_dict={m.input: val_set[0], m.target: val_set[2], m.lr: [0.001]})
+                loss = sess.run(m.loss, feed_dict={m.input: val_set['image'], m.target: val_set['mask'], m.lr: [0.001]})
                 print("Step %d, Loss: %f" % (step, loss))
             batch = TGS_dataset.next_training_batch()
-            sess.run(m.train_op, feed_dict={m.input: batch[0], m.target: batch[2], m.lr: [0.001]})
+            sess.run(m.train_op, feed_dict={m.input: batch['image'], m.target: batch['mask'], m.lr: [0.001]})
+
 
 def test_dataset():
     TGS_dataset = Dataset()
-    print(TGS_dataset.training.iloc[0, :]["image"].shape)
     training_batch = TGS_dataset.next_training_batch()
-    print(training_batch[0].shape)
+    print(training_batch['image'])
 
 
 if __name__ == "__main__":
