@@ -4,3 +4,9 @@
 /train/*
 /*.csv
 /*.zip
+images/
+train/
+.DS_Store
+depths.csv
+sample_submission.csv
+train.csv

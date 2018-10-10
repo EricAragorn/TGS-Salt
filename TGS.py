@@ -1,24 +1,22 @@
-import numpy as np
-import pandas as pd
+import gc
+
 import cv2 as cv
+import pandas as pd
 import tensorflow as tf
 from sklearn.utils import shuffle
-from skimage.transform import resize
-
-import gc
 
 
 class Config:
     TRAINING_SET_RATIO = 0.75
 
     # Model parameters
-    UNet_layers = 4
+    UNet_layers = 1
 
     Initial_Conv_Kernel_Size = (7, 7)
     Initial_Conv_Filters = 64
     Conv_Kernel_Size = (3, 3)
     Conv_Kernel_Initializer = tf.initializers.truncated_normal(stddev=0.5)
-    Conv_Filter_Size = [1, 32, 64, 128, 256]
+    Conv_Filter_Size = [1, 16, 32, 64, 128]
     Conv_Bottleneck_Size = [int(i / 4) for i in Conv_Filter_Size]
     Stacked_ResBlock_Depth = [2, 2, 2, 2, 2]
     Dropout_Ratio = 0.2
@@ -39,33 +37,50 @@ class Batcher:
 class Dataset:
     def __init__(self):
         # TODO Target_data must be converted to mask
-        # TODO Problems with reading images after sorting >:(
-        # read id-depth pairs and corresponding images
-        rawdata = pd.read_csv("depths.csv")
 
-        rawdata["image"] = [cv.imread("train\\images\\%s.png" % id_TGS, cv.IMREAD_GRAYSCALE) for id_TGS in
-                            rawdata["id"]]
-        rawdata["mask"] = [cv.imread("train\\masks\\%s.png" % id_TGS, cv.IMREAD_GRAYSCALE) for id_TGS in rawdata["id"]]
+        # use `itertuples` instead of `iterrows` for performance reason; row[1] = id, row[2] = z
+        data = [self.to_dict(row[1], row[2]) for row in pd.read_csv("depths.csv").itertuples()]
 
-        shuffle(rawdata)
+        # remove data entries with no image/mask
+        data = [img for img in data if img["mask"] is not None]
 
-        self.training = rawdata.iloc[:int(Config.TRAINING_SET_RATIO * rawdata.shape[0]), :]
-        self.validation = rawdata.iloc[int(Config.TRAINING_SET_RATIO * rawdata.shape[0]) + 1:, :]
+        self.num = len(data)
+
+        shuffle(data)
+
+        self.training = data[:int(Config.TRAINING_SET_RATIO * self.num)]
+        self.validation = data[int(Config.TRAINING_SET_RATIO * self.num) + 1:]
         self.batch_base_ptr = 0
 
-
-    def next_training_batch(self, size=256):
-        if self.batch_base_ptr + 256 > self.training.shape[0]:
-            batch = self.training.iloc[self.batch_base_ptr:self.training.shape[0], :]
+    # TODO Training batch returns empty after a few steps
+    def next_training_batch(self, size=32):
+        if self.batch_base_ptr + size >= len(self.training):
+            batch = self.training[self.batch_base_ptr:len(self.training)]
             self.batch_base_ptr = 0
         else:
-            batch = self.training.iloc[self.batch_base_ptr: self.batch_base_ptr + size, :]
+            batch = self.training[self.batch_base_ptr: self.batch_base_ptr + size]
             self.batch_base_ptr = self.batch_base_ptr + size
-        return [batch["image"], batch["z"], batch["mask"]]
+        return self.output(batch)
 
     def get_validation(self):
-        return [self.validation["image"], self.validation["z"], self.validation["mask"]]
+        return self.output(self.validation)
 
+    @staticmethod
+    def to_dict(id, z):
+        return {
+            "image": cv.imread(f"train/masks/{id}.png", cv.IMREAD_GRAYSCALE),
+            "mask": cv.imread(f"train/images/{id}.png", cv.IMREAD_GRAYSCALE),
+            "z": z,
+            "id": id
+        }
+
+    @staticmethod
+    def output(data):
+        return {
+            "image": [e['image'].reshape((101, 101, 1)) for e in data],
+            "z": [e['z'] for e in data],
+            "mask": [e['mask'].reshape((101, 101, 1)) for e in data]
+        }
 
 
 class TGSModel:
@@ -77,7 +92,7 @@ class TGSModel:
         Identity Mappings in Deep Residual Networks by Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun, Jul 2016.
     """
 
-    def __init__(self, optimizer='Adam'):
+    def __init__(self, optimizer='SGD'):
         self.name = "TGS_UNet_w_ResBlocks_v1"
         with tf.name_scope("TGS_input"):
             self.input = tf.placeholder(dtype=tf.float32,
@@ -115,39 +130,40 @@ class TGSModel:
                 dropout = tf.layers.dropout(inputs=pooling, rate=Config.Dropout_Ratio)
                 down_block_output.append(dropout)
 
-        print([out.shape for out in down_block_output])
         # middle layer
         up_features = down_block_output[Config.UNet_layers]
-
+        #
         # upsampling layers
-        for up_block_id in range(Config.UNet_layers - 1, -1, -1):
-            with tf.variable_scope(f"{self.name}/up{up_block_id}"):
-                recovered = tf.layers.conv2d_transpose(inputs=up_features,
-                                                       filters=Config.Conv_Filter_Size[up_block_id],
-                                                       kernel_size=(3, 3),
-                                                       padding=Config.Up_Block_Padding[up_block_id],
-                                                       strides=2)
-                # print(up_block_id)
-                # print(down_block_output[up_block_id].shape)
-                # print(recovered.shape)
-                # print("\n")
-                concat = tf.concat([down_block_output[up_block_id], recovered], axis=-1)
-                concat = tf.layers.conv2d(inputs=concat,
-                                          filters=Config.Conv_Filter_Size[up_block_id],
-                                          kernel_size=(1, 1),
-                                          strides=1)
-                up_features = TGSModel.stacked_res_blocks(inputs=concat,
-                                                          kernel_size=Config.Conv_Kernel_Size,
-                                                          filters=Config.Conv_Filter_Size[up_block_id],
-                                                          bottleneck_filters=Config.Conv_Bottleneck_Size[up_block_id],
-                                                          count=Config.Stacked_ResBlock_Depth[up_block_id])
-
+        # for up_block_id in range(Config.UNet_layers - 1, -1, -1):
+        #     with tf.variable_scope(f"{self.name}/up{up_block_id}"):
+        #         recovered = tf.layers.conv2d_transpose(inputs=up_features,
+        #                                                filters=Config.Conv_Filter_Size[up_block_id],
+        #                                                kernel_size=(3, 3),
+        #                                                padding=Config.Up_Block_Padding[up_block_id],
+        #                                                strides=2)
+        #         # print(up_block_id)
+        #         # print(down_block_output[up_block_id].shape)
+        #         # print(recovered.shape)
+        #         # print("\n")
+        #         concat = tf.concat([down_block_output[up_block_id], recovered], axis=-1)
+        #         concat = tf.layers.conv2d(inputs=concat,
+        #                                   filters=Config.Conv_Filter_Size[up_block_id],
+        #                                   kernel_size=(1, 1),
+        #                                   strides=1)
+        #         up_features = TGSModel.stacked_res_blocks(inputs=concat,
+        #                                                   kernel_size=Config.Conv_Kernel_Size,
+        #                                                   filters=Config.Conv_Filter_Size[up_block_id],
+        #                                                   bottleneck_filters=Config.Conv_Bottleneck_Size[up_block_id],
+        #                                                   count=Config.Stacked_ResBlock_Depth[up_block_id])
+        flattened = tf.layers.flatten(up_features)
+        up_features = tf.layers.dense(inputs=flattened, units=10201, activation=tf.tanh)
         # mask
-        target_mask = tf.layers.flatten(self.input)
-        gen_mask = tf.layers.flatten(up_features)
+        target_mask = tf.layers.flatten(self.target)
+        flattened = tf.layers.flatten(up_features)
+        gen_mask = tf.sigmoid(flattened)
 
         # compute loss
-        self.loss = tf.losses.sigmoid_cross_entropy(target_mask, gen_mask)
+        self.loss = -tf.losses.sigmoid_cross_entropy(target_mask, gen_mask)
 
         self.lr = tf.placeholder(dtype=tf.float32, shape=[])
         if optimizer == 'Adam':
@@ -183,6 +199,7 @@ class TGSModel:
     Identity Mappings in Deep Residual Networks by Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun, Jul 2016.
     """
 
+    # TODO Urgent! Error with tensor sizes causes allocation failures
     @staticmethod
     def bottleneck_block(inputs, kernel_size, filters, bottleneck_filters, block_id, strides=1,
                          shortcut=True):
@@ -212,6 +229,7 @@ class TGSModel:
             bn3 = tf.layers.batch_normalization(inputs=conv2,
                                                 name="bn3")
             relu3 = tf.nn.relu(bn3)
+            print(relu3.shape)
             conv3 = tf.layers.conv2d(inputs=relu3,
                                      kernel_size=(1, 1),
                                      filters=filters,
@@ -234,19 +252,20 @@ def main():
     val_set = TGS_dataset.get_validation()
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
+        print("Start Training...")
         for step in range(2000):
             if step % 10 == 0:
-                loss = sess.run(m.loss, feed_dict={m.input: val_set[0], m.target: val_set[2], m.lr: [0.001]})
+                loss = sess.run(m.loss, feed_dict={m.input: val_set['image'], m.target: val_set['mask'], m.lr: 0.001})
                 print("Step %d, Loss: %f" % (step, loss))
             batch = TGS_dataset.next_training_batch()
-            sess.run(m.train_op, feed_dict={m.input: batch[0], m.target: batch[2], m.lr: [0.001]})
+            sess.run(m.train_op, feed_dict={m.input: batch['image'], m.target: batch['mask'], m.lr: 0.001},
+                     options=tf.RunOptions(report_tensor_allocations_upon_oom=True))
+
 
 def test_dataset():
     TGS_dataset = Dataset()
-    print(TGS_dataset.training.iloc[0, :]["image"].shape)
     training_batch = TGS_dataset.next_training_batch()
-    print(training_batch[0].shape)
 
 
 if __name__ == "__main__":
-    test_dataset()
+    main()
