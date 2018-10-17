@@ -14,21 +14,21 @@ class Config:
     batch_size = 32
 
     # Model parameters
-    UNet_layers = 3
+    UNet_layers = 2
 
-    Initial_Conv_Kernel_Size = (7, 7)
-    Initial_Conv_Filters = 64
+    # Initial_Conv_Kernel_Size = (7, 7)
+    # Initial_Conv_Filters = 64
     Conv_Kernel_Size = (3, 3)
-    Conv_Kernel_Initializer = tf.initializers.truncated_normal(stddev=0.5)
-    Conv_Filter_Size = [1, 16, 32, 64, 128]
+    Conv_Kernel_Initializer = tf.initializers.he_uniform()
+    Conv_Filter_Size = [16, 32, 64, 128, 256]
     Conv_Bottleneck_Size = [int(i / 2) for i in Conv_Filter_Size]
-    Stacked_ResBlock_Depth = [2, 2, 2, 2, 2]
+    Stacked_ResBlock_Depth = [2, 2, 2, 2, 2, 2]
     Dropout_Ratio = 0.2
 
-    Max_Epoch = 20000
+    Max_Epoch = 1000
     initial_lr = 0.01
-    lr_decay_rate = 0.99
-    lr_decay_after = 10000
+    lr_decay_rate = 0.98
+    lr_decay_after = 800
     min_lr = 0.0001
 
     Up_Block_Padding = ['valid', 'same', 'valid', 'same']
@@ -127,7 +127,7 @@ class TGSModel:
     """
 
     # TODO Fix arithmetic exceptions in upsample resblocks
-    def __init__(self, optimizer='SGD'):
+    def __init__(self, optimizer='Adam'):
         TGS_db = Dataset()
 
         self.train_x, self.train_y = TGS_db.train
@@ -136,7 +136,6 @@ class TGSModel:
         #                            tf.placeholder(dtype=np.float32, shape=(None, 101, 101, 1))
 
         # construct tf dataset
-
         train_set = tf.data.Dataset.from_tensor_slices((self.train_x, self.train_y)) \
             .batch(Config.batch_size)
         valid_set = tf.data.Dataset.from_tensor_slices((self.valid_x, self.valid_y)) \
@@ -169,10 +168,11 @@ class TGSModel:
         down_block_output = [self.input]
         up_block_output = []
         # downsampling layers
-        for down_block_id in range(1, Config.UNet_layers + 1):
+        for down_block_id in range(Config.UNet_layers):
             with tf.variable_scope(f"{self.name}/down{down_block_id}"):
-                conv = tf.layers.conv2d(inputs=down_block_output[down_block_id - 1],
+                conv = tf.layers.conv2d(inputs=down_block_output[down_block_id],
                                         kernel_size=(3, 3),
+                                        kernel_initializer=Config.Conv_Kernel_Initializer,
                                         filters=Config.Conv_Filter_Size[down_block_id],
                                         padding='same')
                 resblocks = TGSModel.stacked_res_blocks(inputs=conv,
@@ -186,38 +186,52 @@ class TGSModel:
                 dropout = tf.layers.dropout(inputs=pooling, rate=Config.Dropout_Ratio)
                 down_block_output.append(dropout)
 
+        for _ in down_block_output:
+            print(_.shape)
+        print("////////////////////////////////////////////////////")
+
         # middle layer
-        up_block_output.append(down_block_output[Config.UNet_layers])
+        with tf.variable_scope(f"{self.name}/mid"):
+            conv = tf.layers.conv2d(inputs=down_block_output[Config.UNet_layers],
+                                    kernel_size=(3, 3),
+                                    kernel_initializer=Config.Conv_Kernel_Initializer,
+                                    filters=Config.Conv_Filter_Size[Config.UNet_layers],
+                                    padding="same")
+            middle_out = TGSModel.stacked_res_blocks(inputs=conv,
+                                                     kernel_size=Config.Conv_Kernel_Size,
+                                                     filters=Config.Conv_Filter_Size[Config.UNet_layers],
+                                                     count=Config.Stacked_ResBlock_Depth[Config.UNet_layers])
+        up_block_output.append(middle_out)
         #
         # upsampling layers
         for up_block_id in range(Config.UNet_layers - 1, -1, -1):
             with tf.variable_scope(f"{self.name}/up{up_block_id}"):
+                print(up_block_output[0].shape)
                 conv = tf.layers.conv2d_transpose(inputs=up_block_output[0],
                                                   filters=Config.Conv_Filter_Size[up_block_id],
                                                   kernel_size=(3, 3),
+                                                  kernel_initializer=Config.Conv_Kernel_Initializer,
                                                   padding=Config.Up_Block_Padding[up_block_id],
-                                                  strides=2)
-                concat = tf.concat([down_block_output[up_block_id], conv], axis=-1)
-                up_block_output.insert(0, tf.layers.conv2d(inputs=concat,
-                                                           filters=Config.Conv_Filter_Size[up_block_id],
-                                                           kernel_size=(3, 3),
-                                                           padding="same",
-                                                           strides=1))
-                # up_block_output.insert(0, TGSModel.stacked_res_blocks(inputs=concat,
-                #                                                       kernel_size=Config.Conv_Kernel_Size,
-                #                                                       filters=Config.Conv_Filter_Size[up_block_id],
-                #                                                       bottleneck_filters=Config.Conv_Bottleneck_Size[up_block_id],
-                #                                                       count=Config.Stacked_ResBlock_Depth[up_block_id]))
+                                                  strides=(2, 2),
+                                                  name="conv1")
+                resblocks = TGSModel.stacked_res_blocks(inputs=conv,
+                                                        kernel_size=Config.Conv_Kernel_Size,
+                                                        filters=Config.Conv_Filter_Size[up_block_id],
+                                                        bottleneck_filters=Config.Conv_Bottleneck_Size[up_block_id],
+                                                        count=Config.Stacked_ResBlock_Depth[up_block_id])
+                concat = tf.concat([down_block_output[up_block_id], resblocks], axis=-1, name="concat")
+                up_block_output.insert(0, concat)
         # mask
-        target_mask = self.target
-        self.gen_mask = tf.sigmoid(up_block_output[0])
-
-        # TODO add iou measure
+        gen_mask_noActivation = tf.layers.conv2d(inputs=up_block_output[0],
+                                         filters=1,
+                                         kernel_size=(1, 1),
+                                         kernel_initializer=Config.Conv_Kernel_Initializer)
+        self.gen_mask = tf.sigmoid(gen_mask_noActivation)
 
         # compute loss
-        self.loss = tf.losses.sigmoid_cross_entropy(target_mask, self.gen_mask)
-        self.iou_vector, self.construct_confusion_matrix = tf.metrics.mean_iou(tf.round(target_mask),
-                                                                               tf.round(self.gen_mask), num_classes=2)
+        self.loss = tf.losses.log_loss(self.target, self.gen_mask)
+        # self.iou_vector, self.construct_confusion_matrix = tf.metrics.mean_iou(tf.round(self.target),
+        #                                                                        tf.round(self.gen_mask), num_classes=2)
 
         self.lr = tf.placeholder(dtype=tf.float32, shape=[])
         if optimizer == 'Adam':
@@ -226,28 +240,76 @@ class TGSModel:
             _optimizer = tf.train.GradientDescentOptimizer(learning_rate=self.lr)
         else:
             raise ValueError("Unsupported optimizer")
-        self.train_op = _optimizer.minimize(self.loss)
+        gradients, values = zip(*_optimizer.compute_gradients(self.loss))
+        clipped_gradients, _ = tf.clip_by_global_norm(gradients, 5)
+        self.train_op = _optimizer.apply_gradients(zip(clipped_gradients, values))
 
     @staticmethod
-    def stacked_res_blocks(inputs, kernel_size, filters, bottleneck_filters, count):
+    def stacked_res_blocks(inputs, kernel_size, filters, count, bottleneck_filters=None, type="resblock"):
         if count < 1:
             raise ValueError("The number of stacked residual blocks should be positive")
 
-        last_block = TGSModel.bottleneck_block(inputs=inputs,
+        if type == "resblock":
+            # Original ResBlock
+            last_block = inputs
+            for i in range(count - 1):
+                last_block = TGSModel.resBlock(inputs=last_block,
                                                kernel_size=kernel_size,
                                                filters=filters,
-                                               bottleneck_filters=bottleneck_filters,
-                                               block_id=0,
-                                               shortcut=False)
+                                               block_id=i)
 
-        for i in range(count - 1):
-            last_block = TGSModel.bottleneck_block(inputs=last_block,
+            last_block = TGSModel.resBlock(inputs=last_block,
+                                           kernel_size=kernel_size,
+                                           filters=filters,
+                                           block_id=count - 1,
+                                           activation=True)
+        else:
+            # Bottleneck ResBlock
+            if bottleneck_filters == None:
+                raise ValueError("Bottleneck filter size must be specified for bottleneck resblocks")
+            last_block = TGSModel.bottleneck_block(inputs=inputs,
                                                    kernel_size=kernel_size,
                                                    filters=filters,
                                                    bottleneck_filters=bottleneck_filters,
-                                                   block_id=i + 1)
+                                                   block_id=0,
+                                                   shortcut=False)
+
+            for i in range(count - 1):
+                last_block = TGSModel.bottleneck_block(inputs=last_block,
+                                                       kernel_size=kernel_size,
+                                                       filters=filters,
+                                                       bottleneck_filters=bottleneck_filters,
+                                                       block_id=i + 1)
 
         return last_block
+
+    @staticmethod
+    def resBlock(inputs, kernel_size, filters, block_id, strides=(1, 1), activation=False):
+        with tf.variable_scope(f"ResBlock{block_id}"):
+            bn1 = tf.layers.batch_normalization(inputs=inputs, name="bn1")
+            relu1 = tf.nn.relu(bn1, name="relu1")
+            conv1 = tf.layers.conv2d(inputs=relu1,
+                                     filters=filters,
+                                     kernel_size=kernel_size,
+                                     kernel_initializer=Config.Conv_Kernel_Initializer,
+                                     strides=strides,
+                                     padding="same",
+                                     name="conv1")
+            bn2 = tf.layers.batch_normalization(inputs=conv1, name="bn2")
+            relu2 = tf.nn.relu(bn2, name="relu2")
+            conv2 = tf.layers.conv2d(inputs=relu2,
+                                     filters=filters,
+                                     kernel_size=kernel_size,
+                                     kernel_initializer=Config.Conv_Kernel_Initializer,
+                                     strides=strides,
+                                     padding="same",
+                                     name="conv2")
+            output = tf.add(conv2, inputs)
+            if activation:
+                output = tf.layers.batch_normalization(output, name="output_bn")
+                output = tf.nn.relu(output, name="output_activation")
+            return output
+
 
     """
     Implementation of ResNet bottleneck block
@@ -262,7 +324,7 @@ class TGSModel:
                          shortcut=True):
         BNConv_filters1 = BNConv_filters2 = bottleneck_filters
 
-        with tf.variable_scope(f"Block{block_id}"):
+        with tf.variable_scope(f"BottleNeckResBlock{block_id}"):
             bn1 = tf.layers.batch_normalization(inputs=inputs,
                                                 name="bn1")
             relu1 = tf.nn.relu(bn1)
@@ -302,38 +364,36 @@ class TGSModel:
 def main():
     m = TGSModel()
     with tf.Session() as sess:
-        # train_writer = tf.summary.FileWriter("/train", sess.graph)
+        train_writer = tf.summary.FileWriter("./log", sess.graph)
         sess.run(tf.global_variables_initializer())
         sess.run(tf.local_variables_initializer())
         lr = Config.initial_lr
         print("Start Training...")
-        # sess.run(m.train_init_op)
-        # sess.run([m.img, m.mask])
+        sess.run(m.train_init_op)
+        sess.run([m.img, m.mask])
         for epoch in range(Config.Max_Epoch):
             # Apply learning rate decay
             if epoch > Config.lr_decay_after and lr > Config.min_lr:
                 lr *= Config.lr_decay_rate
 
-            sess.run(m.train_init_op)
-            sess.run([m.img, m.mask])
+            # sess.run(m.train_init_op)
+            # sess.run([m.img, m.mask])
             train_loss, _ = sess.run([m.loss, m.train_op], feed_dict={m.lr: lr})
-            if epoch % 10 == 0:
+            if (epoch + 1) % 10 == 0:
                 batch_loss = []
-                batch_iou = []
                 sess.run(m.valid_init_op)
                 for i in range(10):
                     sess.run([m.img, m.mask])
-                    loss, iou = sess.run([m.loss, m.iou_vector], feed_dict={m.lr: lr})
+                    loss = sess.run([m.loss], feed_dict={m.lr: lr})
                     batch_loss.append(loss)
-                    batch_iou.append(iou)
-                print("Step %d, training loss: %s, validation loss: %f, IoU_Metric: %f"
-                      % (epoch, train_loss, np.mean(batch_loss), np.mean(batch_iou)))
+                print("Step %d, training loss: %s, validation loss: %f"
+                      % (epoch + 1, train_loss, np.mean(batch_loss)))
 
-        sess.run(m.valid_init_op)
-        sess.run([m.img, m.mask])
+        # sess.run(m.valid_init_op)
+        # sess.run([m.img, m.mask])
         input, target, mask = sess.run([m.input, m.target, m.gen_mask])
         for id in range(input.shape[0]):
-            input_img, mask_img, target_img = np.reshape(input[id], newshape=(101, 101)), \
+            input_img, mask_img, target_img = np.reshape(input[id], newshape=(101, 101)) * 255, \
                                               np.reshape(mask[id], newshape=(101, 101)) * 255,\
                                               np.reshape(target[id], newshape=(101, 101)) * 255
             f, ax = plt.subplots(1, 3)
@@ -345,9 +405,12 @@ def main():
 
 
 
-# def test_dataset():
-#     TGS_dataset = Dataset()
-#     training_batch = TGS_dataset.next_training_batch()
+def test():
+    with tf.Session() as sess:
+        x = tf.convert_to_tensor(np.array([999, -999], dtype=np.float32))
+        y = tf.convert_to_tensor(np.array([1, 0], dtype=np.float32))
+        loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=y, logits=x)
+        print(sess.run(loss))
 
 
 if __name__ == "__main__":
