@@ -1,9 +1,8 @@
-import gc
-
 import cv2 as cv
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 
 
@@ -15,28 +14,24 @@ class Config:
     batch_size = 32
 
     # Model parameters
-    UNet_layers = 1
+    UNet_layers = 3
 
     Initial_Conv_Kernel_Size = (7, 7)
     Initial_Conv_Filters = 64
     Conv_Kernel_Size = (3, 3)
     Conv_Kernel_Initializer = tf.initializers.truncated_normal(stddev=0.5)
     Conv_Filter_Size = [1, 16, 32, 64, 128]
-    Conv_Bottleneck_Size = [int(i / 4) for i in Conv_Filter_Size]
+    Conv_Bottleneck_Size = [int(i / 2) for i in Conv_Filter_Size]
     Stacked_ResBlock_Depth = [2, 2, 2, 2, 2]
     Dropout_Ratio = 0.2
 
+    Max_Epoch = 20000
+    initial_lr = 0.01
+    lr_decay_rate = 0.99
+    lr_decay_after = 10000
+    min_lr = 0.0001
+
     Up_Block_Padding = ['valid', 'same', 'valid', 'same']
-
-
-class Batcher:
-    def __init__(self, data):
-        self.data = data
-        self.init_ptr = 0
-
-    def next_batch(self, size):
-        if self.init_ptr + size < self.data.shape[0]:
-            batch = self.data[self.init_ptr:self.init_ptr + size - 1, :, :]
 
 
 class Dataset:
@@ -81,6 +76,11 @@ class Dataset:
 
         x_train = np.append(x_train, [np.fliplr(x) for x in x_train], axis=0)
         y_train = np.append(y_train, [np.fliplr(x) for x in y_train], axis=0)
+        # f, ax = plt.subplots(2, 2)
+        # plt.imshow(train_df["images"][0])
+        # ax[0, 0].imshow(np.reshape(train_df["images"][0], newshape=(101, 101)), cmap="gray")
+        # ax[0, 1].imshow(np.reshape(y_train[0], newshape=(101, 101)), cmap="gray")
+        # plt.show()
         #######################################################################################################
 
         self.train = (x_train, y_train)
@@ -132,19 +132,22 @@ class TGSModel:
 
         self.train_x, self.train_y = TGS_db.train
         self.valid_x, self.valid_y = TGS_db.valid
+        # self.test_x, self.test_y = tf.placeholder(dtype=np.float32, shape=(None, 101, 101, 1)), \
+        #                            tf.placeholder(dtype=np.float32, shape=(None, 101, 101, 1))
 
         # construct tf dataset
 
         train_set = tf.data.Dataset.from_tensor_slices((self.train_x, self.train_y)) \
-            .shuffle(buffer_size=1).batch(Config.batch_size)
+            .batch(Config.batch_size)
         valid_set = tf.data.Dataset.from_tensor_slices((self.valid_x, self.valid_y)) \
-            .shuffle(buffer_size=1).batch(Config.batch_size)
+            .batch(Config.batch_size)
+        # test_set = tf.data.Dataset.from_tensor_slices((self.test_x, self.test_y))
 
         iter = tf.data.Iterator.from_structure(train_set.output_types, train_set.output_shapes)
         self.train_init_op = iter.make_initializer(train_set)
         self.valid_init_op = iter.make_initializer(valid_set)
-        self.img, self.mask = iter.get_next()
-
+        # self.test_init_op = iter.make_initializer(test_set)
+        (self.img, self.mask) = iter.get_next()
 
         self.name = "TGS_UNet_w_ResBlocks_v1"
 
@@ -164,6 +167,7 @@ class TGSModel:
         """
 
         down_block_output = [self.input]
+        up_block_output = []
         # downsampling layers
         for down_block_id in range(1, Config.UNet_layers + 1):
             with tf.variable_scope(f"{self.name}/down{down_block_id}"):
@@ -183,33 +187,37 @@ class TGSModel:
                 down_block_output.append(dropout)
 
         # middle layer
-        up_features = down_block_output[Config.UNet_layers]
+        up_block_output.append(down_block_output[Config.UNet_layers])
         #
         # upsampling layers
         for up_block_id in range(Config.UNet_layers - 1, -1, -1):
             with tf.variable_scope(f"{self.name}/up{up_block_id}"):
-                up_features = tf.layers.conv2d_transpose(inputs=up_features,
-                                                         filters=Config.Conv_Filter_Size[up_block_id],
-                                                         kernel_size=(3, 3),
-                                                         padding=Config.Up_Block_Padding[up_block_id],
-                                                         strides=2)
-                concat = tf.concat([down_block_output[up_block_id], up_features], axis=-1)
-                concat = tf.layers.conv2d(inputs=concat,
-                                          filters=Config.Conv_Filter_Size[up_block_id],
-                                          kernel_size=(1, 1),
-                                          strides=1)
-                # up_features = TGSModel.stacked_res_blocks(inputs=concat,
-                #                                           kernel_size=Config.Conv_Kernel_Size,
-                #                                           filters=Config.Conv_Filter_Size[up_block_id],
-                #                                           bottleneck_filters=Config.Conv_Bottleneck_Size[up_block_id],
-                #                                           count=Config.Stacked_ResBlock_Depth[up_block_id])
+                conv = tf.layers.conv2d_transpose(inputs=up_block_output[0],
+                                                  filters=Config.Conv_Filter_Size[up_block_id],
+                                                  kernel_size=(3, 3),
+                                                  padding=Config.Up_Block_Padding[up_block_id],
+                                                  strides=2)
+                concat = tf.concat([down_block_output[up_block_id], conv], axis=-1)
+                up_block_output.insert(0, tf.layers.conv2d(inputs=concat,
+                                                           filters=Config.Conv_Filter_Size[up_block_id],
+                                                           kernel_size=(3, 3),
+                                                           padding="same",
+                                                           strides=1))
+                # up_block_output.insert(0, TGSModel.stacked_res_blocks(inputs=concat,
+                #                                                       kernel_size=Config.Conv_Kernel_Size,
+                #                                                       filters=Config.Conv_Filter_Size[up_block_id],
+                #                                                       bottleneck_filters=Config.Conv_Bottleneck_Size[up_block_id],
+                #                                                       count=Config.Stacked_ResBlock_Depth[up_block_id]))
         # mask
-        target_mask = tf.layers.flatten(self.target)
-        flattened = tf.layers.flatten(up_features)
-        gen_mask = tf.sigmoid(flattened)
+        target_mask = self.target
+        self.gen_mask = tf.sigmoid(up_block_output[0])
+
+        # TODO add iou measure
 
         # compute loss
-        self.loss = tf.losses.sigmoid_cross_entropy(target_mask, gen_mask)
+        self.loss = tf.losses.sigmoid_cross_entropy(target_mask, self.gen_mask)
+        self.iou_vector, self.construct_confusion_matrix = tf.metrics.mean_iou(tf.round(target_mask),
+                                                                               tf.round(self.gen_mask), num_classes=2)
 
         self.lr = tf.placeholder(dtype=tf.float32, shape=[])
         if optimizer == 'Adam':
@@ -225,9 +233,14 @@ class TGSModel:
         if count < 1:
             raise ValueError("The number of stacked residual blocks should be positive")
 
-        last_block = inputs
+        last_block = TGSModel.bottleneck_block(inputs=inputs,
+                                               kernel_size=kernel_size,
+                                               filters=filters,
+                                               bottleneck_filters=bottleneck_filters,
+                                               block_id=0,
+                                               shortcut=False)
 
-        for i in range(count):
+        for i in range(count - 1):
             last_block = TGSModel.bottleneck_block(inputs=last_block,
                                                    kernel_size=kernel_size,
                                                    filters=filters,
@@ -247,7 +260,7 @@ class TGSModel:
     @staticmethod
     def bottleneck_block(inputs, kernel_size, filters, bottleneck_filters, block_id, strides=1,
                          shortcut=True):
-        filter1 = filter2 = bottleneck_filters
+        BNConv_filters1 = BNConv_filters2 = bottleneck_filters
 
         with tf.variable_scope(f"Block{block_id}"):
             bn1 = tf.layers.batch_normalization(inputs=inputs,
@@ -255,7 +268,7 @@ class TGSModel:
             relu1 = tf.nn.relu(bn1)
             conv1 = tf.layers.conv2d(inputs=relu1,
                                      kernel_size=(1, 1),
-                                     filters=filter1,
+                                     filters=BNConv_filters1,
                                      kernel_initializer=Config.Conv_Kernel_Initializer,
                                      name="conv1")
 
@@ -264,7 +277,7 @@ class TGSModel:
             relu2 = tf.nn.relu(bn2)
             conv2 = tf.layers.conv2d(inputs=relu2,
                                      kernel_size=kernel_size,
-                                     filters=filter2,
+                                     filters=BNConv_filters2,
                                      strides=strides,
                                      padding="same",
                                      kernel_initializer=Config.Conv_Kernel_Initializer,
@@ -287,23 +300,49 @@ class TGSModel:
 
 
 def main():
-    gc.enable()
     m = TGSModel()
     with tf.Session() as sess:
         # train_writer = tf.summary.FileWriter("/train", sess.graph)
         sess.run(tf.global_variables_initializer())
+        sess.run(tf.local_variables_initializer())
+        lr = Config.initial_lr
         print("Start Training...")
-        for step in range(10000):
+        # sess.run(m.train_init_op)
+        # sess.run([m.img, m.mask])
+        for epoch in range(Config.Max_Epoch):
+            # Apply learning rate decay
+            if epoch > Config.lr_decay_after and lr > Config.min_lr:
+                lr *= Config.lr_decay_rate
+
             sess.run(m.train_init_op)
             sess.run([m.img, m.mask])
-            loss, _ = sess.run([m.loss, m.train_op], feed_dict={m.lr: 0.01})
-            if step % 10 == 0:
-                loss = 0
+            train_loss, _ = sess.run([m.loss, m.train_op], feed_dict={m.lr: lr})
+            if epoch % 10 == 0:
+                batch_loss = []
+                batch_iou = []
                 sess.run(m.valid_init_op)
-                for i in range(1):
+                for i in range(10):
                     sess.run([m.img, m.mask])
-                    loss += sess.run(m.loss, feed_dict={m.lr: 0.01})
-                print("Step %d, Loss: %f" % (step, loss / 100))
+                    loss, iou = sess.run([m.loss, m.iou_vector], feed_dict={m.lr: lr})
+                    batch_loss.append(loss)
+                    batch_iou.append(iou)
+                print("Step %d, training loss: %s, validation loss: %f, IoU_Metric: %f"
+                      % (epoch, train_loss, np.mean(batch_loss), np.mean(batch_iou)))
+
+        sess.run(m.valid_init_op)
+        sess.run([m.img, m.mask])
+        input, target, mask = sess.run([m.input, m.target, m.gen_mask])
+        for id in range(input.shape[0]):
+            input_img, mask_img, target_img = np.reshape(input[id], newshape=(101, 101)), \
+                                              np.reshape(mask[id], newshape=(101, 101)) * 255,\
+                                              np.reshape(target[id], newshape=(101, 101)) * 255
+            f, ax = plt.subplots(1, 3)
+            ax[0].imshow(input_img, cmap='gray')
+            ax[1].imshow(mask_img, cmap='gray')
+            ax[2].imshow(target_img, cmap='gray')
+            plt.savefig("output/%d.png" % id)
+            plt.close()
+
 
 
 # def test_dataset():
