@@ -25,14 +25,17 @@ class Config:
     # Conv_Filter_Size = [8, 16, 32, 64, 128]
     Conv_Bottleneck_Size = [int(i / 2) for i in Conv_Filter_Size]
     Stacked_ResBlock_Depth = [2, 2, 2, 2, 2]
-    Dropout_Ratio = 0.2
+    Dropout_Ratio = 0.5
 
-    Max_Epoch = 50
-    Max_steps = 150
+    Max_Epoch = 150
+    Epoch_start_lovasz_loss = 100
+    Max_steps = 180
     initial_lr = 0.0005
     lr_decay_rate = 0.95
-    lr_decay_after = 30
+    lr_decay_after = 120
     min_lr = 0.0001
+
+    Run_itentifier = "lovasz_dropout_run3"
 
     Up_Block_Padding = ['valid', 'same', 'valid', 'same']
 
@@ -53,6 +56,7 @@ class Dataset:
         train_df = pd.read_csv("train.csv", index_col="id", usecols=[0])
         depth_df = pd.read_csv("depths.csv", index_col="id")
         train_df = train_df.join(depth_df)
+        test_df = depth_df[~depth_df.index.isin(train_df.index)]
 
         train_df["images"] = [
             np.array(cv.imread(f"train/images/{idx}.png", flags=cv.IMREAD_GRAYSCALE), dtype=np.float32) / 255
@@ -60,6 +64,9 @@ class Dataset:
         train_df["masks"] = [
             np.array(cv.imread(f"train/masks/{idx}.png", flags=cv.IMREAD_GRAYSCALE), dtype=np.float32) / 255
             for idx in train_df.index]
+        test_df["images"] = [
+            np.array(cv.imread(f"test/images/{idx}.png", flags=cv.IMREAD_GRAYSCALE), dtype=np.float32) / 255
+            for idx in test_df.index]
 
         train_df["coverage"] = train_df["masks"].map(np.sum) / pow(Config.img_size, 2)
 
@@ -79,6 +86,7 @@ class Dataset:
 
         x_train = np.append(x_train, [np.fliplr(x) for x in x_train], axis=0)
         y_train = np.append(y_train, [np.fliplr(x) for x in y_train], axis=0)
+        x_test = np.array(test_df["images"].tolist()).reshape(-1, Config.img_size, Config.img_size, 1)
         # f, ax = plt.subplots(2, 2)
         # plt.imshow(train_df["images"][0])
         # ax[0, 0].imshow(np.reshape(train_df["images"][0], newshape=(101, 101)), cmap="gray")
@@ -86,8 +94,13 @@ class Dataset:
         # plt.show()
         #######################################################################################################
 
+        print(x_test.shape)
+        print(x_train.shape)
+        print(x_valid.shape)
         self.train = (x_train, y_train)
         self.valid = (x_valid, y_valid)
+        self.test = (x_test, np.zeros(shape=x_test.shape, dtype=np.float32))
+        self.test_idx = test_df.index.tolist()
     # self.batch_base_ptr = 0
 
     # def next_training_batch(self, size=32):
@@ -129,12 +142,11 @@ class TGSModel:
         Identity Mappings in Deep Residual Networks by Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun, Jul 2016.
     """
 
-    # TODO Fix arithmetic exceptions in upsample resblocks
-    def __init__(self, optimizer='Adam'):
-        TGS_db = Dataset()
+    def __init__(self, db, optimizer='Adam'):
 
-        self.train_x, self.train_y = TGS_db.train
-        self.valid_x, self.valid_y = TGS_db.valid
+        self.train_x, self.train_y = db.train
+        self.valid_x, self.valid_y = db.valid
+        self.test_x, _ = db.test
         # self.test_x, self.test_y = tf.placeholder(dtype=np.float32, shape=(None, 101, 101, 1)), \
         #                            tf.placeholder(dtype=np.float32, shape=(None, 101, 101, 1))
 
@@ -143,11 +155,12 @@ class TGSModel:
             .batch(Config.batch_size)
         valid_set = tf.data.Dataset.from_tensor_slices((self.valid_x, self.valid_y)) \
             .batch(Config.batch_size)
-        # test_set = tf.data.Dataset.from_tensor_slices((self.test_x, self.test_y))
+        test_set = tf.data.Dataset.from_tensor_slices((self.test_x, _)).batch(1)
 
         iter = tf.data.Iterator.from_structure(train_set.output_types, train_set.output_shapes)
         self.train_init_op = iter.make_initializer(train_set)
         self.valid_init_op = iter.make_initializer(valid_set)
+        self.test_init_op = iter.make_initializer(test_set)
         # self.test_init_op = iter.make_initializer(test_set)
         img, mask = iter.get_next()
 
@@ -188,8 +201,8 @@ class TGSModel:
                 pooling = tf.layers.max_pooling2d(inputs=resblocks,
                                                   pool_size=(2, 2),
                                                   strides=2)
-                prev = pooling
-                # dropout = tf.layers.dropout(inputs=pooling, rate=Config.Dropout_Ratio)
+                dropout = tf.layers.dropout(inputs=pooling, rate=Config.Dropout_Ratio)
+                prev = dropout
                 down_block_output.append(resblocks)
 
         # middle layer
@@ -210,8 +223,8 @@ class TGSModel:
         # upsampling layers
         for up_block_id in range(Config.UNet_layers - 1, -1, -1):
             with tf.variable_scope(f"{self.name}/up{up_block_id}"):
-                # dropout = tf.layers.dropout(up_block_output[0], rate=Config.Dropout_Ratio)
-                conv1 = tf.layers.conv2d_transpose(inputs=prev,
+                dropout = tf.layers.dropout(prev, rate=Config.Dropout_Ratio)
+                conv1 = tf.layers.conv2d_transpose(inputs=dropout,
                                                    filters=Config.Conv_Filter_Size[up_block_id],
                                                    kernel_size=(3, 3),
                                                    kernel_initializer=Config.Conv_Kernel_Initializer,
@@ -240,8 +253,93 @@ class TGSModel:
                                                  kernel_initializer=Config.Conv_Kernel_Initializer)
         # self.gen_mask = tf.sigmoid(gen_mask_noActivation)
 
+        # code download from: https://github.com/bermanmaxim/LovaszSoftmax
+        def lovasz_grad(gt_sorted):
+            """
+            Computes gradient of the Lovasz extension w.r.t sorted errors
+            See Alg. 1 in paper
+            """
+            gts = tf.reduce_sum(gt_sorted)
+            intersection = gts - tf.cumsum(gt_sorted)
+            union = gts + tf.cumsum(1. - gt_sorted)
+            jaccard = 1. - intersection / union
+            jaccard = tf.concat((jaccard[0:1], jaccard[1:] - jaccard[:-1]), 0)
+            return jaccard
+
+        # --------------------------- BINARY LOSSES ---------------------------
+
+        def lovasz_hinge(logits, labels, per_image=True, ignore=None):
+            """
+            Binary Lovasz hinge loss
+              logits: [B, H, W] Variable, logits at each pixel (between -\infty and +\infty)
+              labels: [B, H, W] Tensor, binary ground truth masks (0 or 1)
+              per_image: compute the loss per image instead of per batch
+              ignore: void class id
+            """
+            if per_image:
+                def treat_image(log_lab):
+                    log, lab = log_lab
+                    log, lab = tf.expand_dims(log, 0), tf.expand_dims(lab, 0)
+                    log, lab = flatten_binary_scores(log, lab, ignore)
+                    return lovasz_hinge_flat(log, lab)
+
+                losses = tf.map_fn(treat_image, (logits, labels), dtype=tf.float32)
+                loss = tf.reduce_mean(losses)
+            else:
+                loss = lovasz_hinge_flat(*flatten_binary_scores(logits, labels, ignore))
+            return loss
+
+        def lovasz_hinge_flat(logits, labels):
+            """
+            Binary Lovasz hinge loss
+              logits: [P] Variable, logits at each prediction (between -\infty and +\infty)
+              labels: [P] Tensor, binary ground truth labels (0 or 1)
+              ignore: label to ignore
+            """
+
+            def compute_loss():
+                labelsf = tf.cast(labels, logits.dtype)
+                signs = 2. * labelsf - 1.
+                errors = 1. - logits * tf.stop_gradient(signs)
+                errors_sorted, perm = tf.nn.top_k(errors, k=tf.shape(errors)[0], name="descending_sort")
+                gt_sorted = tf.gather(labelsf, perm)
+                grad = lovasz_grad(gt_sorted)
+                loss = tf.tensordot(tf.nn.relu(errors_sorted), tf.stop_gradient(grad), 1, name="loss_non_void")
+                return loss
+
+            # deal with the void prediction case (only void pixels)
+            loss = tf.cond(tf.equal(tf.shape(logits)[0], 0),
+                           lambda: tf.reduce_sum(logits) * 0.,
+                           compute_loss,
+                           strict=True,
+                           name="loss"
+                           )
+            return loss
+
+        def flatten_binary_scores(scores, labels, ignore=None):
+            """
+            Flattens predictions in the batch (binary case)
+            Remove labels equal to 'ignore'
+            """
+            scores = tf.reshape(scores, (-1,))
+            labels = tf.reshape(labels, (-1,))
+            if ignore is None:
+                return scores, labels
+            valid = tf.not_equal(labels, ignore)
+            vscores = tf.boolean_mask(scores, valid, name='valid_scores')
+            vlabels = tf.boolean_mask(labels, valid, name='valid_labels')
+            return vscores, vlabels
+
+        def lovasz_loss(y_true, y_pred):
+            y_true, y_pred = tf.squeeze(y_true, -1), tf.squeeze(y_pred, -1)
+            # logits = tf.log(y_pred / (1. - y_pred))
+            logits = y_pred  # Jiaxin
+            loss = lovasz_hinge(logits, y_true, per_image=True, ignore=None)
+            return loss
+
         # compute loss
         self.loss = tf.losses.sigmoid_cross_entropy(self.target, gen_mask_noActivation)
+        self.lovasz_loss = lovasz_loss(self.target, gen_mask_noActivation)
 
         self.lr = tf.placeholder(dtype=tf.float32, shape=[])
         if optimizer == 'Adam':
@@ -251,15 +349,36 @@ class TGSModel:
         else:
             raise ValueError("Unsupported optimizer")
         update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+
         with tf.control_dependencies(update_ops):
             gradients, values = zip(*_optimizer.compute_gradients(self.loss))
             clipped_gradients, _ = tf.clip_by_global_norm(gradients, 5)
             self.train_op = _optimizer.apply_gradients(zip(clipped_gradients, values))
 
+        with tf.control_dependencies(update_ops):
+            gradients, values = zip(*_optimizer.compute_gradients(self.lovasz_loss))
+            clipped_gradients, _ = tf.clip_by_global_norm(gradients, 5)
+            self.lovasz_train_op = _optimizer.apply_gradients(zip(clipped_gradients, values))
+
         self.prediction = tf.round(tf.sigmoid(gen_mask_noActivation))
-        inter = tf.reduce_sum(tf.multiply(self.prediction, self.target))
-        union = tf.reduce_sum(tf.subtract(tf.add(self.prediction, self.target), tf.multiply(self.prediction, self.target)))
-        self.iou_vector = inter / union
+
+        def get_iou_vector(A, B):
+            batch_size = A.shape[0]
+            metric = []
+            for batch in range(batch_size):
+                t, p = A[batch] > 0, B[batch] > 0
+
+                intersection = np.logical_and(t, p)
+                union = np.logical_or(t, p)
+                iou = (np.sum(intersection > 0) + 1e-10) / (np.sum(union > 0) + 1e-10)
+                thresholds = np.arange(0.5, 1, 0.05)
+                s = []
+                for thresh in thresholds:
+                    s.append(iou > thresh)
+                metric.append(np.mean(s))
+            return np.mean(metric, dtype=np.float32)
+
+        self.iou_vector = tf.py_func(get_iou_vector, [self.target, self.prediction], tf.float32)
 
     @staticmethod
     def stacked_res_blocks(inputs, kernel_size, filters, count, bottleneck_filters=None, type="resblock"):
@@ -391,8 +510,10 @@ class TGSModel:
 
 
 def main():
-    m = TGSModel()
-    # saver = tf.train.Saver()
+
+    db = Dataset()
+    m = TGSModel(db)
+    saver = tf.train.Saver()
     with tf.Session() as sess:
         train_writer = tf.summary.FileWriter("./log", sess.graph)
         sess.run(tf.global_variables_initializer())
@@ -400,23 +521,32 @@ def main():
         lr = Config.initial_lr
         print("Start Training...")
         # sess.run([m.img, m.mask])
+        best_valid_iou = 0
         for epoch in range(Config.Max_Epoch):
             print("Epoch %d/%d:" % (epoch + 1, Config.Max_Epoch))
             # Apply learning rate decay
-            if epoch > Config.lr_decay_after and lr > Config.min_lr:
+            if (epoch + 1) > Config.lr_decay_after and lr > Config.min_lr:
                 lr *= Config.lr_decay_rate
+
+            if (epoch + 1) > Config.Epoch_start_lovasz_loss:
+                loss = m.lovasz_loss
+                train_op = m.lovasz_train_op
+            else:
+                loss = m.loss
+                train_op = m.train_op
 
             epoch_train_loss = []
             epoch_train_iou = []
 
             sess.run(m.train_init_op)
             for step in range(Config.Max_steps):
-                _, train_loss, train_iou = sess.run([m.train_op, m.loss, m.iou_vector], feed_dict={m.lr: lr})
+                _, train_loss, train_iou = sess.run([train_op, loss, m.iou_vector], feed_dict={m.lr: lr})
                 epoch_train_loss.append(train_loss)
                 epoch_train_iou.append(train_iou)
 
             epoch_val_loss = []
             epoch_val_iou = []
+
             sess.run(m.valid_init_op)
             for i in range(10):
                 loss, iou = sess.run([m.loss, m.iou_vector], feed_dict={m.lr: lr})
@@ -424,8 +554,15 @@ def main():
                 epoch_val_iou.append(iou)
             print("\t training loss: %s, train_iou: %s, validation loss: %s, validation_iou: %s"
                   % (np.mean(epoch_train_loss), np.mean(epoch_train_iou), np.mean(epoch_val_loss), np.mean(epoch_val_iou)))
-            # if (epoch + 1) % 5000:
-            #     saver.save(sess, 'UNet2-ResNet34', global_step=epoch+1)
+            valid_iou_score = np.mean(epoch_val_iou)
+            if valid_iou_score > best_valid_iou:
+                print("validation_iou improved from %s to %s" % (best_valid_iou, valid_iou_score))
+                save_path = saver.save(sess, "saved_models/%s_best.ckpt" % Config.Run_itentifier)
+                print("Model saved at %s: " % save_path)
+                best_valid_iou = valid_iou_score
+
+            if (epoch + 1) == Config.Epoch_start_lovasz_loss:
+                print("Start using lovasz loss")
 
         def gen_visualization(dir):
             input, target, mask, middle_out, _test_ = sess.run([m.input, m.target, m.prediction, m.middle_out, m._test_])
@@ -465,17 +602,20 @@ def main():
         sess.run(m.valid_init_op)
         gen_visualization("valid_output")
 
+        save_path = saver.save(sess, "saved_models/%s_final.ckpt" % Config.Run_itentifier)
+        print("Model saved in: %s" % save_path)
+
 
 def test():
     x = tf.convert_to_tensor(np.array([1, 0], dtype=np.float32))
     y = tf.convert_to_tensor(np.array([0, 0], dtype=np.float32))
     loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=y, logits=x)
-    iou, initializer = tf.metrics.mean_iou(x, y, num_classes=2)
-    with tf.Session() as sess:
-        sess.run(tf.local_variables_initializer())
-        sess.run(initializer)
-        print(sess.run(loss))
-        print(sess.run(iou))
+    # iou, initializer = tf.metrics.mean_iou(x, y, num_classes=2)
+
+    # iou_vector = tf.py_func(get_iou_vector, [x, y], tf.float32)
+    # with tf.Session() as sess:
+    #     sess.run(tf.local_variables_initializer())
+    #     print(sess.run(iou_vector))
 
 
 def testResBlock():
@@ -503,6 +643,49 @@ def testResBlock():
         for i in range(1000):
             sess.run(train_op)
             print("Step: %d, Loss %f" % (i, sess.run(loss)))
+
+def eval():
+    """
+    used for converting the decoded image to rle mask
+    Fast compared to previous one
+    """
+
+    def rle_encode(im):
+        '''
+        im: numpy array, 1 - mask, 0 - background
+        Returns run length as string formated
+        '''
+        pixels = im.flatten(order='F')
+        pixels = np.concatenate([[0], pixels, [0]])
+        runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+        runs[1::2] -= runs[::2]
+        return ' '.join(str(x) for x in runs)
+
+    db = Dataset()
+    m = TGSModel(db)
+    saver = tf.train.Saver()
+    pred_dict = {}
+    with tf.Session() as sess:
+        saver.restore(sess, "saved_models/lovasz_dropout_run2_best.ckpt")
+        print("Model restored.")
+        sess.run(m.test_init_op)
+        count = 0
+        for idx in db.test_idx:
+            input, pred = sess.run([m.input, m.prediction])
+            input = np.reshape(input, newshape=(101, 101))
+            pred = np.reshape(pred, newshape=(101, 101))
+            pred_dict[idx] = rle_encode(pred)
+            if count % 500 == 0:
+                f, ax = plt.subplots(1, 2)
+                ax[0].imshow(input, cmap='gray')
+                ax[1].imshow(pred, cmap='gray')
+                plt.savefig("test_output/%s.png" % idx)
+                plt.close()
+            count += 1
+    submit = pd.DataFrame.from_dict(pred_dict, orient='index')
+    submit.index.names = ['id']
+    submit.columns = ['rle_mask']
+    submit.to_csv("submission.csv")
 
 
 if __name__ == "__main__":
