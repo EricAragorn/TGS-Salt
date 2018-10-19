@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 import matplotlib.pyplot as plt
+import imgaug as ia
+from imgaug import augmenters as iaa
 from sklearn.model_selection import train_test_split
 
 
@@ -11,7 +13,7 @@ class Config:
 
     # Data parameters
     img_size = 101
-    batch_size = 32
+    batch_size = 128
 
     # Model parameters
     UNet_layers = 4
@@ -28,15 +30,19 @@ class Config:
     Up_Block_Padding = ['valid', 'same', 'valid', 'same']
     Dropout_Ratio = 0.5
 
-    Max_Epoch = 300
-    Epoch_start_lovasz_loss = 200
-    Max_steps = 180
-    initial_lr = 0.0002
-    lr_decay_rate = 0.95
-    lr_decay_after = 150
-    min_lr = 0.00005
+    Max_Epoch = 10
+    BCE_Epoch = 10
+    Lovasz_Epoch_1 = 200
+    Lovasz_Epoch_2 = 50
+    # Epoch_start_lovasz_loss = 100
+    Max_steps = 45
+    initial_lr = 1e-3
+    # lr_decay_rate = 0.95
+    # lr_decay_after = 150
+    lovasz_lr = 5e-4
+    lovasz_lr_2 = 1e-4
 
-    Run_itentifier = "lovasz_dropout_run4"
+    Run_itentifier = "lovasz_dropout_run5"
 
     Visualize = False
 
@@ -49,7 +55,7 @@ class Dataset:
         # data = [self.to_dict(row[1], row[2]) for row in pd.read_csv("depths.csv").itertuples()]
         #
         # # remove data entries with no image/mask
-        # data = [img for img in data if img["mask"] is not None]
+        # data = [dropout_run1 for dropout_run1 in data if dropout_run1["mask"] is not None]
 
         ######################################################################################################
         # code from https://www.kaggle.com/shaojiaxin/u-net-with-simple-resnet-blocks-v2-new-loss
@@ -85,8 +91,70 @@ class Dataset:
             train_df["z"].values,
             test_size=0.2, stratify=train_df["coverage_class"], random_state=1234)
 
-        x_train = np.append(x_train, [np.fliplr(x) for x in x_train], axis=0)
-        y_train = np.append(y_train, [np.fliplr(x) for x in y_train], axis=0)
+        def do_augmentation(seqs, seq2_train, X_train, y_train):
+            # Use seq_det to build augmentation.
+
+            seq_det = seqs.to_deterministic()
+            X_train_aug = seq_det.augment_image(X_train)
+            X_train_aug = seq2_train.augment_image(X_train_aug)
+
+            y_train_aug = seq_det.augment_image(y_train)
+
+            if y_train_aug.shape != (101, 101):
+                X_train_aug = ia.imresize_single_image(X_train_aug, (101, 101), interpolation="linear")
+                y_train_aug = ia.imresize_single_image(y_train_aug, (101, 101), interpolation="nearest")
+
+            return np.array(X_train_aug), np.array(y_train_aug)
+
+        # Sometimes(0.5, ...) applies the given augmenter in 50% of all cases,
+        # e.g. Sometimes(0.5, GaussianBlur(0.3)) would blur roughly every second image.
+        sometimes = lambda aug: iaa.Sometimes(0.5, aug)
+
+        seq = iaa.Sequential([
+            iaa.Fliplr(0.5),  # horizontally flip
+
+            iaa.OneOf([
+                iaa.Noop(),
+                iaa.Affine(rotate=(-10, 10), translate_percent={"x": (-0.25, 0.25)}, mode='symmetric', cval=(0),
+                           backend="cv2"),
+                iaa.Noop(),
+                iaa.CropAndPad(
+                    percent=(-0.2, 0.2),
+                    pad_mode="reflect",
+                    pad_cval=0,
+                    keep_size=False
+                ),
+                # aa.Noop(),
+                # aa.PiecewiseAffine(scale=(0.01, 0.1), mode='edge', cval=(0)),
+            ])
+
+            # More as you want ...
+        ])
+        seq_train = iaa.Sequential(
+            sometimes(iaa.Multiply((0.8, 1.2))),  # , per_channel=0.5
+            sometimes(iaa.Add((-0.2, 0.2))),  # , per_channel=0.5
+            sometimes(iaa.OneOf([
+                iaa.AdditiveGaussianNoise(scale=(0, 0.05)),
+                iaa.GaussianBlur(sigma=(0.0, 1.0)),
+            ]))
+
+        )
+
+        def aug_img(features, labels):
+            all_batches_index = np.arange(0, features.shape[0])
+            out_images = []
+            out_masks = []
+            np.random.shuffle(all_batches_index)
+            for index in all_batches_index:
+                c_img, c_mask = do_augmentation(seq, seq_train, features[index], labels[index])
+
+                out_images += [c_img]
+                out_masks += [c_mask]
+            return out_images, out_masks
+
+        x_train, y_train = aug_img(x_train, y_train)
+
+
         x_test = np.array(test_df["images"].tolist()).reshape(-1, Config.img_size, Config.img_size, 1)
         # f, ax = plt.subplots(2, 2)
         # plt.imshow(train_df["images"][0])
@@ -332,7 +400,7 @@ class TGSModel:
             return vscores, vlabels
 
         def lovasz_loss(y_true, y_pred):
-            y_true, y_pred = tf.squeeze(y_true, -1), tf.squeeze(y_pred, -1)
+            y_true, y_pred = tf.cast(tf.squeeze(y_true, -1), tf.int32), tf.cast(tf.squeeze(y_pred, -1), tf.float32)
             # logits = tf.log(y_pred / (1. - y_pred))
             logits = y_pred  # Jiaxin
             loss = lovasz_hinge(logits, y_true, per_image=True, ignore=None)
@@ -520,17 +588,20 @@ def main():
         sess.run(tf.local_variables_initializer())
         lr = Config.initial_lr
         print("Start Training...")
-        # sess.run([m.img, m.mask])
+        # sess.run([m.dropout_run1, m.mask])
         best_valid_iou = 0
         for epoch in range(Config.Max_Epoch):
             print("Epoch %d/%d:" % (epoch + 1, Config.Max_Epoch))
             # Apply learning rate decay
-            if (epoch + 1) > Config.lr_decay_after and lr > Config.min_lr:
-                lr *= Config.lr_decay_rate
+            # if (epoch + 1) > Config.lr_decay_after and lr > Config.min_lr:
+            #     lr *= Config.lr_decay_rate
 
-            if (epoch + 1) > Config.Epoch_start_lovasz_loss:
+            if (epoch + 1) > Config.BCE_Epoch:
                 loss = m.lovasz_loss
                 train_op = m.lovasz_train_op
+                lr = Config.lovasz_lr
+                if (epoch + 1) > (Config.BCE_Epoch + Config.Lovasz_Epoch_1):
+                    lr = Config.lovasz_lr_2
             else:
                 loss = m.loss
                 train_op = m.train_op
@@ -548,7 +619,7 @@ def main():
             epoch_val_iou = []
 
             sess.run(m.valid_init_op)
-            for i in range(10):
+            for i in range(3):
                 loss, iou = sess.run([m.loss, m.iou_vector], feed_dict={m.lr: lr})
                 epoch_val_loss.append(loss)
                 epoch_val_iou.append(iou)
@@ -561,7 +632,7 @@ def main():
                 print("Model saved at %s: " % save_path)
                 best_valid_iou = valid_iou_score
 
-            if (epoch + 1) == Config.Epoch_start_lovasz_loss:
+            if (epoch + 1) == Config.BCE_Epoch:
                 print("Start using lovasz loss")
 
         def gen_visualization(dir):
@@ -659,7 +730,7 @@ def eval():
     saver = tf.train.Saver()
     pred_dict = {}
     with tf.Session() as sess:
-        saver.restore(sess, "saved_models/lovasz_dropout_run2_best.ckpt")
+        saver.restore(sess, "saved_models/%s_best.ckpt" % Config.Run_itentifier)
         print("Model restored.")
         sess.run(m.test_init_op)
         count = 0
@@ -683,3 +754,4 @@ def eval():
 
 if __name__ == "__main__":
     main()
+    eval()
