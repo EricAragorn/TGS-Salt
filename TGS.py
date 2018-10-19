@@ -25,19 +25,20 @@ class Config:
     # Conv_Filter_Size = [8, 16, 32, 64, 128]
     Conv_Bottleneck_Size = [int(i / 2) for i in Conv_Filter_Size]
     Stacked_ResBlock_Depth = [2, 2, 2, 2, 2]
+    Up_Block_Padding = ['valid', 'same', 'valid', 'same']
     Dropout_Ratio = 0.5
 
-    Max_Epoch = 150
-    Epoch_start_lovasz_loss = 100
+    Max_Epoch = 300
+    Epoch_start_lovasz_loss = 200
     Max_steps = 180
-    initial_lr = 0.0005
+    initial_lr = 0.0002
     lr_decay_rate = 0.95
-    lr_decay_after = 120
-    min_lr = 0.0001
+    lr_decay_after = 150
+    min_lr = 0.00005
 
-    Run_itentifier = "lovasz_dropout_run3"
+    Run_itentifier = "lovasz_dropout_run4"
 
-    Up_Block_Padding = ['valid', 'same', 'valid', 'same']
+    Visualize = False
 
 
 class Dataset:
@@ -212,7 +213,7 @@ class TGSModel:
                                     kernel_initializer=Config.Conv_Kernel_Initializer,
                                     filters=Config.Conv_Filter_Size[Config.UNet_layers],
                                     padding="same")
-            self._test_ = conv
+            # self._test_ = conv
             # self.middle_out = tf.nn.leaky_relu(conv)
             self.middle_out = TGSModel.stacked_res_blocks(inputs=conv,
                                                           kernel_size=Config.Conv_Kernel_Size,
@@ -304,7 +305,7 @@ class TGSModel:
                 errors_sorted, perm = tf.nn.top_k(errors, k=tf.shape(errors)[0], name="descending_sort")
                 gt_sorted = tf.gather(labelsf, perm)
                 grad = lovasz_grad(gt_sorted)
-                loss = tf.tensordot(tf.nn.relu(errors_sorted), tf.stop_gradient(grad), 1, name="loss_non_void")
+                loss = tf.tensordot(tf.nn.elu(errors_sorted), tf.stop_gradient(grad), 1, name="loss_non_void")
                 return loss
 
             # deal with the void prediction case (only void pixels)
@@ -413,8 +414,7 @@ class TGSModel:
             # Bottleneck ResBlock
             if bottleneck_filters is None:
                 raise ValueError("Bottleneck filter size must be specified for bottleneck resblocks")
-            last_block = TGSModel.bottleneck_block(
-                                                   inputs=inputs,
+            last_block = TGSModel.bottleneck_block(inputs=inputs,
                                                    kernel_size=kernel_size,
                                                    filters=filters,
                                                    bottleneck_filters=bottleneck_filters,
@@ -468,7 +468,7 @@ class TGSModel:
     """
 
     @staticmethod
-    def bottleneck_block(self, inputs, kernel_size, filters, bottleneck_filters, block_id, strides=1,
+    def bottleneck_block(inputs, kernel_size, filters, bottleneck_filters, block_id, strides=1,
                          shortcut=True):
         BNConv_filters1 = BNConv_filters2 = bottleneck_filters
 
@@ -565,7 +565,7 @@ def main():
                 print("Start using lovasz loss")
 
         def gen_visualization(dir):
-            input, target, mask, middle_out, _test_ = sess.run([m.input, m.target, m.prediction, m.middle_out, m._test_])
+            input, target, mask, middle_out = sess.run([m.input, m.target, m.prediction, m.middle_out])
 
             for id in range(input.shape[0]):
                 input_img, mask_img, target_img = np.reshape(input[id], newshape=(101, 101)) * 255, \
@@ -578,32 +578,25 @@ def main():
                 plt.savefig("%s/%d.png" % (dir, id))
                 plt.close()
 
-                fig, ax = plt.subplots(int(middle_out.shape[3] / 20) + 1, 20)
-                for filter in range(middle_out.shape[3]):
-                    ax[int(filter / 20), int(filter % 20)].imshow(np.reshape(middle_out[id, :, :, int(filter)],
-                                                                             newshape=(middle_out.shape[1],
-                                                                                       middle_out.shape[2])) * 255)
-                    ax[int(filter / 20), int(filter % 20)].axis('off')
-                plt.savefig("%s/%d_mid.png" % (dir, id))
-                plt.close()
-
-                fig, ax = plt.subplots(int(_test_.shape[3] / 20) + 1, 20)
-                for filter in range(_test_.shape[3]):
-                    ax[int(filter / 20), int(filter % 20)].imshow(np.reshape(_test_[id, :, :, int(filter)],
-                                                                             newshape=(_test_.shape[1],
-                                                                                       _test_.shape[2])) * 255)
-                    ax[int(filter / 20), int(filter % 20)].axis('off')
-                plt.savefig("%s/%d_test.png" % (dir, id))
-                plt.close()
-
-        sess.run(m.train_init_op)
-        gen_visualization("train_output")
-
-        sess.run(m.valid_init_op)
-        gen_visualization("valid_output")
+                # fig, ax = plt.subplots(int(middle_out.shape[3] / 20) + 1, 20)
+                # for filter in range(middle_out.shape[3]):
+                #     ax[int(filter / 20), int(filter % 20)].imshow(np.reshape(middle_out[id, :, :, int(filter)],
+                #                                                              newshape=(middle_out.shape[1],
+                #                                                                        middle_out.shape[2])) * 255)
+                #     ax[int(filter / 20), int(filter % 20)].axis('off')
+                # plt.savefig("%s/%d_mid.png" % (dir, id))
+                # plt.close()
 
         save_path = saver.save(sess, "saved_models/%s_final.ckpt" % Config.Run_itentifier)
         print("Model saved in: %s" % save_path)
+
+        if Config.Visualize:
+            print("Creating visualization...")
+            sess.run(m.train_init_op)
+            gen_visualization("train_output")
+
+            sess.run(m.valid_init_op)
+            gen_visualization("valid_output")
 
 
 def test():
