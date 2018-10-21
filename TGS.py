@@ -30,8 +30,8 @@ class Config:
     Up_Block_Padding = ['valid', 'same', 'valid', 'same']
     Dropout_Ratio = 0.5
 
-    Max_Epoch = 10
-    BCE_Epoch = 10
+    Max_Epoch = 750
+    BCE_Epoch = 500
     Lovasz_Epoch_1 = 200
     Lovasz_Epoch_2 = 50
     # Epoch_start_lovasz_loss = 100
@@ -41,8 +41,9 @@ class Config:
     # lr_decay_after = 150
     lovasz_lr = 5e-4
     lovasz_lr_2 = 1e-4
+    Save_after = 0
 
-    Run_itentifier = "lovasz_dropout_run5"
+    Run_itentifier = "lovasz_dropout_run8"
 
     Visualize = False
 
@@ -140,20 +141,36 @@ class Dataset:
 
         )
 
-        def aug_img(features, labels):
+        def make_image_gen(features, labels, batch_size=Config.batch_size):
             all_batches_index = np.arange(0, features.shape[0])
             out_images = []
             out_masks = []
-            np.random.shuffle(all_batches_index)
-            for index in all_batches_index:
-                c_img, c_mask = do_augmentation(seq, seq_train, features[index], labels[index])
+            while True:
+                np.random.shuffle(all_batches_index)
+                for index in all_batches_index:
+                    c_img, c_mask = do_augmentation(seq, seq_train, features[index], labels[index])
 
-                out_images += [c_img]
-                out_masks += [c_mask]
-            return out_images, out_masks
+                    out_images += [c_img]
+                    out_masks += [c_mask]
+                    if len(out_images) >= batch_size:
+                        yield np.stack(out_images, 0), np.stack(out_masks, 0)
+                        out_images, out_masks = [], []
 
-        x_train, y_train = aug_img(x_train, y_train)
+        self.train_generator = make_image_gen(x_train, y_train)
 
+        # x_train_aug, y_train_aug = aug_img(x_train, y_train)
+        #
+        # x_train_aug = np.array(x_train_aug).reshape(-1, 101, 101, 1)
+        # y_train_aug = np.array(y_train_aug).reshape(-1, 101, 101, 1)
+        #
+        # x_train = np.concatenate((x_train, x_train_aug), axis=0)
+        # y_train = np.concatenate((y_train, y_train_aug), axis=0)
+
+        # x_valid = np.append(x_valid, [np.fliplr(x) for x in x_train], axis=0)
+        # y_valid = np.append(y_valid, [np.fliplr(x) for x in y_train], axis=0)
+
+        # print(x_train.shape)
+        # print(y_train.shape)
 
         x_test = np.array(test_df["images"].tolist()).reshape(-1, Config.img_size, Config.img_size, 1)
         # f, ax = plt.subplots(2, 2)
@@ -166,7 +183,6 @@ class Dataset:
         print(x_test.shape)
         print(x_train.shape)
         print(x_valid.shape)
-        self.train = (x_train, y_train)
         self.valid = (x_valid, y_valid)
         self.test = (x_test, np.zeros(shape=x_test.shape, dtype=np.float32))
         self.test_idx = test_df.index.tolist()
@@ -213,7 +229,8 @@ class TGSModel:
 
     def __init__(self, db, optimizer='Adam'):
 
-        self.train_x, self.train_y = db.train
+        self.train_x, self.train_y = tf.placeholder(dtype=np.float32, shape=(None, 101, 101, 1)), \
+                                     tf.placeholder(dtype=np.float32, shape=(None, 101, 101, 1))
         self.valid_x, self.valid_y = db.valid
         self.test_x, _ = db.test
         # self.test_x, self.test_y = tf.placeholder(dtype=np.float32, shape=(None, 101, 101, 1)), \
@@ -249,6 +266,7 @@ class TGSModel:
         L5              down4------->up4
         L6                  features
         """
+        # self.is_training = tf.placeholder(dtype=tf.bool, shape=1)
 
         prev = self.input
         down_block_output = []
@@ -266,6 +284,7 @@ class TGSModel:
                                                         kernel_size=Config.Conv_Kernel_Size,
                                                         filters=Config.Conv_Filter_Size[down_block_id],
                                                         bottleneck_filters=Config.Conv_Bottleneck_Size[down_block_id],
+                                                        is_training=True,
                                                         count=Config.Stacked_ResBlock_Depth[down_block_id])
                 pooling = tf.layers.max_pooling2d(inputs=resblocks,
                                                   pool_size=(2, 2),
@@ -286,6 +305,7 @@ class TGSModel:
             self.middle_out = TGSModel.stacked_res_blocks(inputs=conv,
                                                           kernel_size=Config.Conv_Kernel_Size,
                                                           filters=Config.Conv_Filter_Size[Config.UNet_layers],
+                                                          is_training=True,
                                                           count=Config.Stacked_ResBlock_Depth[Config.UNet_layers])
         prev = self.middle_out
         #
@@ -312,6 +332,7 @@ class TGSModel:
                                                         kernel_size=Config.Conv_Kernel_Size,
                                                         filters=Config.Conv_Filter_Size[up_block_id],
                                                         bottleneck_filters=Config.Conv_Bottleneck_Size[up_block_id],
+                                                        is_training=True,
                                                         count=Config.Stacked_ResBlock_Depth[up_block_id])
                 prev = resblocks
                 up_block_output.insert(0, resblocks)
@@ -450,7 +471,7 @@ class TGSModel:
         self.iou_vector = tf.py_func(get_iou_vector, [self.target, self.prediction], tf.float32)
 
     @staticmethod
-    def stacked_res_blocks(inputs, kernel_size, filters, count, bottleneck_filters=None, type="resblock"):
+    def stacked_res_blocks(inputs, kernel_size, filters, count, is_training, bottleneck_filters=None, type="resblock"):
         if count < 1:
             raise ValueError("The number of stacked residual blocks should be positive")
 
@@ -461,11 +482,13 @@ class TGSModel:
                 last_block = TGSModel.resBlock(inputs=last_block,
                                                kernel_size=kernel_size,
                                                filters=filters,
+                                               is_training=is_training,
                                                block_id=i)
 
             last_block = TGSModel.resBlock(inputs=last_block,
                                            kernel_size=kernel_size,
                                            filters=filters,
+                                           is_training=is_training,
                                            block_id=count - 1,
                                            activation=True)
 
@@ -500,7 +523,7 @@ class TGSModel:
 
     # ResBlock_v2
     @staticmethod
-    def resBlock(inputs, kernel_size, filters, block_id, strides=(1, 1), activation=False):
+    def resBlock(inputs, kernel_size, filters, block_id, is_training, strides=(1, 1), activation=False):
         with tf.variable_scope(f"ResBlock{block_id}"):
             bn1 = tf.layers.batch_normalization(inputs=inputs, name="bn1")
             relu1 = tf.nn.leaky_relu(bn1, name="relu1")
@@ -584,8 +607,9 @@ def main():
     saver = tf.train.Saver()
     with tf.Session() as sess:
         train_writer = tf.summary.FileWriter("./log", sess.graph)
-        sess.run(tf.global_variables_initializer())
-        sess.run(tf.local_variables_initializer())
+        # sess.run(tf.global_variables_initializer())
+        # sess.run(tf.local_variables_initializer())
+        saver.restore(sess, "saved_models/lovasz_dropout_run7_best.ckpt")
         lr = Config.initial_lr
         print("Start Training...")
         # sess.run([m.dropout_run1, m.mask])
@@ -609,12 +633,19 @@ def main():
             epoch_train_loss = []
             epoch_train_iou = []
 
-            sess.run(m.train_init_op)
+            train_x, train_y = [], []
+            gen = db.train_generator
+            for step in range(Config.Max_steps):
+                aug_x, aug_y = next(gen)
+                train_x.append(aug_x)
+                train_y.append(aug_y)
+            train_x = np.reshape(np.concatenate(train_x, axis=0), newshape=(-1, 101, 101, 1))
+            train_y = np.reshape(np.concatenate(train_y, axis=0), newshape=(-1, 101, 101, 1))
+            sess.run(m.train_init_op, feed_dict={m.train_x: train_x, m.train_y: train_y})
             for step in range(Config.Max_steps):
                 _, train_loss, train_iou = sess.run([train_op, loss, m.iou_vector], feed_dict={m.lr: lr})
                 epoch_train_loss.append(train_loss)
                 epoch_train_iou.append(train_iou)
-
             epoch_val_loss = []
             epoch_val_iou = []
 
@@ -628,12 +659,14 @@ def main():
             valid_iou_score = np.mean(epoch_val_iou)
             if valid_iou_score > best_valid_iou:
                 print("validation_iou improved from %s to %s" % (best_valid_iou, valid_iou_score))
-                save_path = saver.save(sess, "saved_models/%s_best.ckpt" % Config.Run_itentifier)
-                print("Model saved at %s: " % save_path)
+                if epoch+1 > Config.Save_after:
+                    save_path = saver.save(sess, "saved_models/%s_best.ckpt" % Config.Run_itentifier)
+                    print("Model saved at %s: " % save_path)
                 best_valid_iou = valid_iou_score
 
             if (epoch + 1) == Config.BCE_Epoch:
                 print("Start using lovasz loss")
+                saver.restore(sess, "saved_models/%s_best.ckpt" % Config.Run_itentifier)
 
         def gen_visualization(dir):
             input, target, mask, middle_out = sess.run([m.input, m.target, m.prediction, m.middle_out])
@@ -739,12 +772,12 @@ def eval():
             input = np.reshape(input, newshape=(101, 101))
             pred = np.reshape(pred, newshape=(101, 101))
             pred_dict[idx] = rle_encode(pred)
-            if count % 500 == 0:
-                f, ax = plt.subplots(1, 2)
-                ax[0].imshow(input, cmap='gray')
-                ax[1].imshow(pred, cmap='gray')
-                plt.savefig("test_output/%s.png" % idx)
-                plt.close()
+            # if count % 500 == 0:
+            #     f, ax = plt.subplots(1, 2)
+            #     ax[0].imshow(input, cmap='gray')
+            #     ax[1].imshow(pred, cmap='gray')
+            #     plt.savefig("test_output/%s.png" % idx)
+            #     plt.close()
             count += 1
     submit = pd.DataFrame.from_dict(pred_dict, orient='index')
     submit.index.names = ['id']
@@ -753,5 +786,4 @@ def eval():
 
 
 if __name__ == "__main__":
-    main()
     eval()
